@@ -23,35 +23,33 @@ const App: React.FC = () => {
   const [isSyncing, setIsSyncing] = useState(false);
   
   const roomRef = useRef<Room | null>(null);
-  const sendStateRef = useRef<((data: GameState) => void) | null>(null);
+  const sendStateRef = useRef<((data: GameState, peerId?: string) => void) | null>(null);
+  const announceNameRef = useRef<((name: string) => void) | null>(null);
   const gameStateRef = useRef<GameState>(gameState);
 
-  // Sincronizziamo il Ref con lo Stato
+  // Sincronizziamo il Ref con lo Stato per le callback P2P
   useEffect(() => {
     gameStateRef.current = gameState;
   }, [gameState]);
 
-  // Helper per ottenere la carta intera dall'ID
   const getCard = (id: string | null): DialectCard | null => {
     if (!id) return null;
     return ALL_CARDS.find(c => c.id === id) || null;
   };
 
-  // Funzione unificata per aggiornare e trasmettere
   const updateGameState = useCallback((updater: (prev: GameState) => GameState) => {
     setGameState(prev => {
       const next = updater(prev);
       const updatedState = { 
         ...next, 
         lastUpdated: Date.now(),
-        // Assicuriamoci che il nostro nome sia sempre nella lista
         playerNames: Array.from(new Set([...(next.playerNames || []), myPlayerName]))
       };
       
       if (sendStateRef.current) {
         sendStateRef.current(updatedState);
         setIsSyncing(true);
-        setTimeout(() => setIsSyncing(false), 1000);
+        setTimeout(() => setIsSyncing(false), 800);
       }
       
       return updatedState;
@@ -86,19 +84,23 @@ const App: React.FC = () => {
   };
 
   const connectToRoom = (rId: string, pName: string) => {
-    // ID app univoco per evitare conflitti globali
-    const config = { appId: 'dialect-p2p-v3-final' };
+    const config = { appId: 'dialect-p2p-v4-final' };
     const room = joinRoom(config, rId.toLowerCase().trim());
     roomRef.current = room;
 
     const [sendState, getState] = room.makeAction<GameState>('gameState');
+    const [announceName, getName] = room.makeAction<string>('announceName');
+    
     sendStateRef.current = sendState;
+    announceNameRef.current = announceName;
 
     room.onPeerJoin(peerId => {
       setPeers(prev => [...prev, peerId]);
-      // IMPORTANTE: Usa il ref per mandare lo stato reale, non la chiusura obsoleta
-      if (gameStateRef.current.gameStarted && sendState) {
-        sendState(gameStateRef.current);
+      // Annuncia il proprio nome al nuovo arrivato
+      announceName(pName);
+      // Se il gioco è già iniziato, invia lo stato DIRETTAMENTE al nuovo peer
+      if (gameStateRef.current.gameStarted) {
+        sendState(gameStateRef.current, peerId);
       }
     });
 
@@ -106,12 +108,19 @@ const App: React.FC = () => {
       setPeers(prev => prev.filter(p => p !== peerId));
     });
 
+    getName((name) => {
+      setGameState(prev => ({
+        ...prev,
+        playerNames: Array.from(new Set([...(prev.playerNames || []), name]))
+      }));
+    });
+
     getState((data) => {
       setGameState(prev => {
-        // Accettiamo lo stato solo se è più recente del nostro
-        if (data.lastUpdated > prev.lastUpdated || !prev.gameStarted) {
-          // Mantieni la nostra mano se non è presente nel pacchetto ricevuto
+        // Accettiamo lo stato se è più recente OPPURE se noi non abbiamo ancora iniziato
+        if (!prev.gameStarted || data.lastUpdated > prev.lastUpdated) {
           const newHands = { ...data.hands };
+          // Preserva la propria mano se non inclusa (o inizializzala)
           if (!newHands[pName]) {
             newHands[pName] = prev.hands[pName] || [];
           }
@@ -119,20 +128,23 @@ const App: React.FC = () => {
         }
         return prev;
       });
+      setIsSyncing(true);
+      setTimeout(() => setIsSyncing(false), 800);
     });
 
     setRoomId(rId);
     setMyPlayerName(pName);
+    
+    // Annuncia subito il proprio nome a chi è già presente
+    setTimeout(() => announceName(pName), 500);
   };
 
   const drawCard = (deckKey: keyof GameState['decks']) => {
     updateGameState(prev => {
       const deck = [...prev.decks[deckKey]];
       if (deck.length === 0) return prev;
-      
       const cardId = deck.pop()!;
       const myCurrentHandIds = prev.hands[myPlayerName] || [];
-      
       return {
         ...prev,
         decks: { ...prev.decks, [deckKey]: deck },
@@ -182,7 +194,6 @@ const App: React.FC = () => {
   const CardView: React.FC<{ cardId: string, isDiscarded?: boolean }> = ({ cardId, isDiscarded }) => {
     const card = getCard(cardId);
     if (!card) return null;
-
     return (
       <div 
         onClick={() => setSelectedCardId(cardId)}
@@ -231,7 +242,7 @@ const App: React.FC = () => {
             <h1 className="text-2xl font-cinzel font-bold tracking-[0.2em] text-stone-50">DIALECT</h1>
             <div className="flex items-center gap-2">
                <span className="text-[8px] px-1.5 py-0.5 bg-stone-700 rounded text-stone-500 font-mono tracking-tighter uppercase">STANZA: {roomId}</span>
-               {isSyncing && <span className="text-[8px] text-green-400 font-bold animate-pulse">● SINCRONIZZATO</span>}
+               {isSyncing && <span className="text-[8px] text-green-400 font-bold animate-pulse">● AGGIORNATO</span>}
             </div>
           </div>
           
@@ -247,14 +258,14 @@ const App: React.FC = () => {
             </div>
             <div className="h-6 w-px bg-stone-700"></div>
             <div className="flex flex-col">
-              <span className="text-[8px] uppercase tracking-widest text-stone-500 font-bold">Altri Online</span>
-              <div className="flex gap-1 overflow-hidden max-w-[150px]">
+              <span className="text-[8px] uppercase tracking-widest text-stone-500 font-bold">Giocatori Online</span>
+              <div className="flex gap-1 overflow-hidden max-w-[200px]">
                 {gameState.playerNames?.filter(n => n !== myPlayerName).length > 0 ? (
                    gameState.playerNames.filter(n => n !== myPlayerName).map((n, i) => (
-                     <span key={i} className="text-stone-200 font-bold text-xs whitespace-nowrap">{n}{i < gameState.playerNames.length - 2 ? ',' : ''}</span>
+                     <span key={i} className="text-stone-200 font-bold text-xs whitespace-nowrap">{n}{i < gameState.playerNames.filter(name => name !== myPlayerName).length - 1 ? ',' : ''}</span>
                    ))
                 ) : (
-                  <span className="text-stone-500 text-[10px] italic">In attesa...</span>
+                  <span className="text-stone-500 text-[10px] italic">Solo tu</span>
                 )}
               </div>
             </div>
@@ -418,7 +429,6 @@ const App: React.FC = () => {
 const LoginScreen: React.FC<{ onConnect: (rId: string, pName: string) => void }> = ({ onConnect }) => {
   const [pName, setPName] = useState('');
   const [rId, setRId] = useState('');
-
   return (
     <div className="min-h-screen bg-stone-900 flex items-center justify-center p-6 font-crimson">
       <div className="max-w-md w-full bg-[#f5f2e9] rounded-[2rem] border-4 border-stone-800 shadow-2xl p-10 space-y-8 animate-in zoom-in-95">
@@ -472,7 +482,6 @@ const SetupScreen: React.FC<{ roomId: string, peersCount: number, onStart: () =>
             <span className="text-[10px] font-bold text-stone-600 uppercase tracking-widest">{peersCount} Altri Connessi</span>
           </div>
         </div>
-
         <div className="space-y-8 bg-white/50 p-8 rounded-3xl border-2 border-stone-100 shadow-inner text-center">
            <div className="space-y-2">
               <p className="text-stone-700 font-cinzel text-lg font-bold">Pronti per il Racconto?</p>
@@ -481,14 +490,12 @@ const SetupScreen: React.FC<{ roomId: string, peersCount: number, onStart: () =>
               </p>
            </div>
         </div>
-
         <button 
           onClick={() => onStart()}
           className="w-full bg-red-950 text-white font-cinzel text-2xl font-bold py-7 rounded-3xl hover:bg-red-800 transition-all shadow-2xl shadow-red-950/40 active:scale-95"
         >
           INIZIA IL GIOCO
         </button>
-        
         <div className="text-center text-[10px] text-stone-400 font-bold uppercase tracking-[0.2em]">
           Stanza: <span className="text-red-900">{roomId.toUpperCase()}</span>
         </div>
