@@ -20,15 +20,16 @@ export interface DialectCard {
 
 export interface GameState {
   gameStarted: boolean;
-  version: number; // Incrementato per ogni modifica locale per forzare il broadcast
+  lastUpdated: number; // Timestamp per determinare la versione più recente
+  playerNames: string[]; // Lista dei nomi dei giocatori connessi
   decks: {
-    archetypes: string[]; // Solo ID
+    archetypes: string[];
     age1: string[];
     age2: string[];
     age3: string[];
     legacy: string[];
   };
-  hands: Record<string, string[]>; // NomeGiocatore -> ID[]
-  tableau: string[]; // Solo ID
-  discardPile: string[]; // Solo ID
+  hands: Record<string, string[]>;
+  tableau: string[];
+  discardPile: string[];
 }

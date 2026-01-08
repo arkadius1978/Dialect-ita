@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { DialectCard, CardType, GameState } from './types';
 import { ALL_CARDS } from './constants';
 import { joinRoom, Room } from 'trystero';
@@ -7,7 +7,8 @@ import { joinRoom, Room } from 'trystero';
 const App: React.FC = () => {
   const [gameState, setGameState] = useState<GameState>({
     gameStarted: false,
-    version: 0,
+    lastUpdated: 0,
+    playerNames: [],
     decks: { archetypes: [], age1: [], age2: [], age3: [], legacy: [] },
     hands: {},
     tableau: [],
@@ -19,10 +20,16 @@ const App: React.FC = () => {
   const [peers, setPeers] = useState<string[]>([]);
   const [activeTab, setActiveTab] = useState<'table' | 'hand' | 'discard'>('table');
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
   
   const roomRef = useRef<Room | null>(null);
   const sendStateRef = useRef<((data: GameState) => void) | null>(null);
-  const lastReceivedVersionRef = useRef<number>(-1);
+  const gameStateRef = useRef<GameState>(gameState);
+
+  // Sincronizziamo il Ref con lo Stato
+  useEffect(() => {
+    gameStateRef.current = gameState;
+  }, [gameState]);
 
   // Helper per ottenere la carta intera dall'ID
   const getCard = (id: string | null): DialectCard | null => {
@@ -30,22 +37,26 @@ const App: React.FC = () => {
     return ALL_CARDS.find(c => c.id === id) || null;
   };
 
-  // Sincronizzazione: quando lo stato locale cambia e noi siamo gli autori, lo mandiamo agli altri
-  useEffect(() => {
-    if (gameState.gameStarted && sendStateRef.current) {
-      // Se la versione locale è maggiore di quella che abbiamo ricevuto dall'esterno, trasmettiamo
-      if (gameState.version > lastReceivedVersionRef.current) {
-        sendStateRef.current(gameState);
-      }
-    }
-  }, [gameState]);
-
+  // Funzione unificata per aggiornare e trasmettere
   const updateGameState = useCallback((updater: (prev: GameState) => GameState) => {
     setGameState(prev => {
       const next = updater(prev);
-      return { ...next, version: prev.version + 1 };
+      const updatedState = { 
+        ...next, 
+        lastUpdated: Date.now(),
+        // Assicuriamoci che il nostro nome sia sempre nella lista
+        playerNames: Array.from(new Set([...(next.playerNames || []), myPlayerName]))
+      };
+      
+      if (sendStateRef.current) {
+        sendStateRef.current(updatedState);
+        setIsSyncing(true);
+        setTimeout(() => setIsSyncing(false), 1000);
+      }
+      
+      return updatedState;
     });
-  }, []);
+  }, [myPlayerName]);
 
   const shuffle = <T,>(array: T[]): T[] => {
     const newArray = [...array];
@@ -59,7 +70,8 @@ const App: React.FC = () => {
   const initializeGame = () => {
     updateGameState(() => ({
       gameStarted: true,
-      version: 1,
+      lastUpdated: Date.now(),
+      playerNames: [myPlayerName],
       decks: {
         archetypes: shuffle(ALL_CARDS.filter(c => c.type === CardType.ARCHETYPE).map(c => c.id)),
         age1: shuffle(ALL_CARDS.filter(c => c.type === CardType.AGE1).map(c => c.id)),
@@ -74,7 +86,8 @@ const App: React.FC = () => {
   };
 
   const connectToRoom = (rId: string, pName: string) => {
-    const config = { appId: 'dialect-p2p-sync-v2' };
+    // ID app univoco per evitare conflitti globali
+    const config = { appId: 'dialect-p2p-v3-final' };
     const room = joinRoom(config, rId.toLowerCase().trim());
     roomRef.current = room;
 
@@ -83,9 +96,9 @@ const App: React.FC = () => {
 
     room.onPeerJoin(peerId => {
       setPeers(prev => [...prev, peerId]);
-      // Se siamo già in gioco, mandiamo lo stato al nuovo arrivato
-      if (gameState.gameStarted) {
-        sendState(gameState);
+      // IMPORTANTE: Usa il ref per mandare lo stato reale, non la chiusura obsoleta
+      if (gameStateRef.current.gameStarted && sendState) {
+        sendState(gameStateRef.current);
       }
     });
 
@@ -94,15 +107,15 @@ const App: React.FC = () => {
     });
 
     getState((data) => {
-      // Accettiamo lo stato solo se è più recente del nostro o se non abbiamo ancora iniziato
       setGameState(prev => {
-        if (data.version > prev.version || !prev.gameStarted) {
-          lastReceivedVersionRef.current = data.version;
-          // Assicuriamoci che la nostra mano esista nel nuovo stato ricevuto
-          if (data.gameStarted && !data.hands[pName]) {
-            data.hands[pName] = [];
+        // Accettiamo lo stato solo se è più recente del nostro
+        if (data.lastUpdated > prev.lastUpdated || !prev.gameStarted) {
+          // Mantieni la nostra mano se non è presente nel pacchetto ricevuto
+          const newHands = { ...data.hands };
+          if (!newHands[pName]) {
+            newHands[pName] = prev.hands[pName] || [];
           }
-          return data;
+          return { ...data, hands: newHands };
         }
         return prev;
       });
@@ -218,6 +231,7 @@ const App: React.FC = () => {
             <h1 className="text-2xl font-cinzel font-bold tracking-[0.2em] text-stone-50">DIALECT</h1>
             <div className="flex items-center gap-2">
                <span className="text-[8px] px-1.5 py-0.5 bg-stone-700 rounded text-stone-500 font-mono tracking-tighter uppercase">STANZA: {roomId}</span>
+               {isSyncing && <span className="text-[8px] text-green-400 font-bold animate-pulse">● SINCRONIZZATO</span>}
             </div>
           </div>
           
@@ -227,14 +241,22 @@ const App: React.FC = () => {
                 <div className="w-2 h-2 bg-green-500 rounded-full pulse-online"></div>
               </div>
               <div className="flex flex-col">
-                <span className="text-[8px] uppercase tracking-widest text-stone-500 font-bold">Giocatore</span>
+                <span className="text-[8px] uppercase tracking-widest text-stone-500 font-bold">Tu</span>
                 <span className="text-stone-200 font-bold text-xs">{myPlayerName}</span>
               </div>
             </div>
             <div className="h-6 w-px bg-stone-700"></div>
             <div className="flex flex-col">
-              <span className="text-[8px] uppercase tracking-widest text-stone-500 font-bold">Online</span>
-              <span className="text-stone-200 font-bold text-xs">{peers.length}</span>
+              <span className="text-[8px] uppercase tracking-widest text-stone-500 font-bold">Altri Online</span>
+              <div className="flex gap-1 overflow-hidden max-w-[150px]">
+                {gameState.playerNames?.filter(n => n !== myPlayerName).length > 0 ? (
+                   gameState.playerNames.filter(n => n !== myPlayerName).map((n, i) => (
+                     <span key={i} className="text-stone-200 font-bold text-xs whitespace-nowrap">{n}{i < gameState.playerNames.length - 2 ? ',' : ''}</span>
+                   ))
+                ) : (
+                  <span className="text-stone-500 text-[10px] italic">In attesa...</span>
+                )}
+              </div>
             </div>
             <button 
               onClick={() => { if(confirm("Tornare al menu principale?")) location.reload(); }}
