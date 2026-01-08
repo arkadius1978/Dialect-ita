@@ -1,0 +1,5 @@
+{
+  "name": "Dialect: Gestore di Carte Digitale",
+  "description": "Un'applicazione web per gestire i mazzi di carte del gioco di ruolo Dialect, con supporto completo per la traduzione italiana e gestione delle mani dei giocatori.",
+  "requestFramePermissions": []
+}
