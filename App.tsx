@@ -21,13 +21,15 @@ const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'table' | 'hand' | 'discard'>('table');
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
   
   const roomRef = useRef<Room | null>(null);
   const sendStateRef = useRef<((data: GameState, peerId?: string) => void) | null>(null);
   const announceNameRef = useRef<((name: string) => void) | null>(null);
+  const requestStateRef = useRef<((data: null) => void) | null>(null);
   const gameStateRef = useRef<GameState>(gameState);
 
-  // Sincronizziamo il Ref con lo Stato per le callback P2P
+  // Manteniamo il ref sempre aggiornato per le callback P2P
   useEffect(() => {
     gameStateRef.current = gameState;
   }, [gameState]);
@@ -37,7 +39,18 @@ const App: React.FC = () => {
     return ALL_CARDS.find(c => c.id === id) || null;
   };
 
-  const updateGameState = useCallback((updater: (prev: GameState) => GameState) => {
+  const handleManualSync = useCallback(() => {
+    if (requestStateRef.current) {
+      setIsSyncing(true);
+      requestStateRef.current(null);
+      // Annuncia di nuovo il proprio nome per sicurezza
+      if (announceNameRef.current) announceNameRef.current(myPlayerName);
+      setTimeout(() => setIsSyncing(false), 1500);
+    }
+  }, [myPlayerName]);
+
+  // Funzione centralizzata per aggiornare lo stato e propagarlo
+  const updateGameState = useCallback((updater: (prev: GameState) => GameState, skipBroadcast = false) => {
     setGameState(prev => {
       const next = updater(prev);
       const updatedState = { 
@@ -46,7 +59,7 @@ const App: React.FC = () => {
         playerNames: Array.from(new Set([...(next.playerNames || []), myPlayerName]))
       };
       
-      if (sendStateRef.current) {
+      if (!skipBroadcast && sendStateRef.current) {
         sendStateRef.current(updatedState);
         setIsSyncing(true);
         setTimeout(() => setIsSyncing(false), 800);
@@ -84,21 +97,23 @@ const App: React.FC = () => {
   };
 
   const connectToRoom = (rId: string, pName: string) => {
-    const config = { appId: 'dialect-p2p-v4-final' };
+    setConnectionStatus('connecting');
+    const config = { appId: 'dialect-p2p-v6-sync' };
     const room = joinRoom(config, rId.toLowerCase().trim());
     roomRef.current = room;
 
     const [sendState, getState] = room.makeAction<GameState>('gameState');
     const [announceName, getName] = room.makeAction<string>('announceName');
+    const [requestState, getRequest] = room.makeAction<null>('requestState');
     
     sendStateRef.current = sendState;
     announceNameRef.current = announceName;
+    requestStateRef.current = requestState;
 
     room.onPeerJoin(peerId => {
       setPeers(prev => [...prev, peerId]);
-      // Annuncia il proprio nome al nuovo arrivato
+      setConnectionStatus('connected');
       announceName(pName);
-      // Se il gioco è già iniziato, invia lo stato DIRETTAMENTE al nuovo peer
       if (gameStateRef.current.gameStarted) {
         sendState(gameStateRef.current, peerId);
       }
@@ -115,12 +130,18 @@ const App: React.FC = () => {
       }));
     });
 
+    getRequest((_, peerId) => {
+      if (gameStateRef.current.gameStarted) {
+        sendState(gameStateRef.current, peerId);
+      }
+    });
+
     getState((data) => {
       setGameState(prev => {
-        // Accettiamo lo stato se è più recente OPPURE se noi non abbiamo ancora iniziato
-        if (!prev.gameStarted || data.lastUpdated > prev.lastUpdated) {
+        const isFreshStart = !prev.gameStarted && data.gameStarted;
+        const isNewer = data.lastUpdated > prev.lastUpdated;
+        if (isFreshStart || isNewer) {
           const newHands = { ...data.hands };
-          // Preserva la propria mano se non inclusa (o inizializzala)
           if (!newHands[pName]) {
             newHands[pName] = prev.hands[pName] || [];
           }
@@ -135,8 +156,11 @@ const App: React.FC = () => {
     setRoomId(rId);
     setMyPlayerName(pName);
     
-    // Annuncia subito il proprio nome a chi è già presente
-    setTimeout(() => announceName(pName), 500);
+    setTimeout(() => {
+      announceName(pName);
+      requestState(null);
+      setConnectionStatus('connected');
+    }, 1500);
   };
 
   const drawCard = (deckKey: keyof GameState['decks']) => {
@@ -226,7 +250,18 @@ const App: React.FC = () => {
   }
 
   if (!gameState.gameStarted) {
-    return <SetupScreen onStart={initializeGame} roomId={roomId} peersCount={peers.length} />;
+    return (
+      <SetupScreen 
+        onStart={initializeGame} 
+        roomId={roomId} 
+        peersCount={peers.length} 
+        status={connectionStatus}
+        playerNames={gameState.playerNames}
+        myPlayerName={myPlayerName}
+        onRefresh={handleManualSync}
+        isSyncing={isSyncing}
+      />
+    );
   }
 
   const selectedCard = getCard(selectedCardId);
@@ -240,9 +275,20 @@ const App: React.FC = () => {
         <div className="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center gap-4">
           <div className="flex flex-col">
             <h1 className="text-2xl font-cinzel font-bold tracking-[0.2em] text-stone-50">DIALECT</h1>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-3">
                <span className="text-[8px] px-1.5 py-0.5 bg-stone-700 rounded text-stone-500 font-mono tracking-tighter uppercase">STANZA: {roomId}</span>
-               {isSyncing && <span className="text-[8px] text-green-400 font-bold animate-pulse">● AGGIORNATO</span>}
+               <div className="flex items-center gap-2">
+                 {isSyncing ? (
+                    <span className="text-[8px] text-green-400 font-bold animate-pulse">● SINCRONIZZAZIONE...</span>
+                 ) : (
+                    <button 
+                      onClick={handleManualSync}
+                      className="text-[8px] text-stone-500 hover:text-white font-bold border border-stone-700 px-2 py-0.5 rounded transition-colors uppercase tracking-widest"
+                    >
+                      Aggiorna
+                    </button>
+                 )}
+               </div>
             </div>
           </div>
           
@@ -258,11 +304,13 @@ const App: React.FC = () => {
             </div>
             <div className="h-6 w-px bg-stone-700"></div>
             <div className="flex flex-col">
-              <span className="text-[8px] uppercase tracking-widest text-stone-500 font-bold">Giocatori Online</span>
+              <span className="text-[8px] uppercase tracking-widest text-stone-500 font-bold">Giocatori</span>
               <div className="flex gap-1 overflow-hidden max-w-[200px]">
-                {gameState.playerNames?.filter(n => n !== myPlayerName).length > 0 ? (
-                   gameState.playerNames.filter(n => n !== myPlayerName).map((n, i) => (
-                     <span key={i} className="text-stone-200 font-bold text-xs whitespace-nowrap">{n}{i < gameState.playerNames.filter(name => name !== myPlayerName).length - 1 ? ',' : ''}</span>
+                {gameState.playerNames?.length > 0 ? (
+                   gameState.playerNames.map((n, i) => (
+                     <span key={i} className={`text-xs font-bold whitespace-nowrap ${n === myPlayerName ? 'text-red-400' : 'text-stone-200'}`}>
+                       {n}{i < gameState.playerNames.length - 1 ? ',' : ''}
+                     </span>
                    ))
                 ) : (
                   <span className="text-stone-500 text-[10px] italic">Solo tu</span>
@@ -463,41 +511,72 @@ const LoginScreen: React.FC<{ onConnect: (rId: string, pName: string) => void }>
             ENTRA NELLA STANZA
           </button>
         </div>
-        <p className="text-[10px] text-stone-400 text-center uppercase tracking-widest font-bold leading-relaxed">
-          Assicurati che i tuoi amici usino lo stesso nome stanza
-        </p>
       </div>
     </div>
   );
 };
 
-const SetupScreen: React.FC<{ roomId: string, peersCount: number, onStart: () => void }> = ({ roomId, peersCount, onStart }) => {
+const SetupScreen: React.FC<{ 
+  roomId: string, 
+  peersCount: number, 
+  onStart: () => void,
+  status: string,
+  playerNames: string[],
+  myPlayerName: string,
+  onRefresh: () => void,
+  isSyncing: boolean
+}> = ({ roomId, peersCount, onStart, status, playerNames, myPlayerName, onRefresh, isSyncing }) => {
   return (
     <div className="min-h-screen bg-stone-900 flex items-center justify-center p-6">
       <div className="max-w-lg w-full bg-[#f5f2e9] rounded-[2.5rem] border-4 border-stone-800 shadow-2xl p-12 space-y-10 animate-in fade-in duration-700">
         <div className="text-center">
           <h2 className="font-cinzel text-4xl font-bold text-stone-800 tracking-widest mb-2">SALA D'ATTESA</h2>
-          <div className="inline-flex items-center gap-2 bg-stone-200 px-3 py-1 rounded-full border border-stone-300">
-            <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-            <span className="text-[10px] font-bold text-stone-600 uppercase tracking-widest">{peersCount} Altri Connessi</span>
+          <div className="inline-flex flex-col items-center gap-2">
+            <div className="flex items-center gap-2 bg-stone-200 px-3 py-1 rounded-full border border-stone-300">
+              <div className={`w-2 h-2 rounded-full ${status === 'connected' ? 'bg-green-500 animate-pulse' : 'bg-yellow-500'}`}></div>
+              <span className="text-[10px] font-bold text-stone-600 uppercase tracking-widest">
+                {status === 'connected' ? 'Connesso alla rete P2P' : 'Connessione in corso...'}
+              </span>
+            </div>
+            <button 
+              onClick={onRefresh}
+              disabled={isSyncing}
+              className={`text-[9px] font-bold uppercase tracking-widest transition-all ${isSyncing ? 'text-stone-300' : 'text-red-900 hover:text-red-700 underline underline-offset-4'}`}
+            >
+              {isSyncing ? 'Sincronizzazione...' : 'Non vedi gli altri? Clicca per aggiornare'}
+            </button>
           </div>
         </div>
-        <div className="space-y-8 bg-white/50 p-8 rounded-3xl border-2 border-stone-100 shadow-inner text-center">
-           <div className="space-y-2">
-              <p className="text-stone-700 font-cinzel text-lg font-bold">Pronti per il Racconto?</p>
-              <p className="text-xs text-stone-500 leading-relaxed italic">
-                "Una volta iniziato, i mazzi saranno mescolati e pronti per l'Isolamento."
-              </p>
+
+        <div className="space-y-4 bg-white/50 p-6 rounded-3xl border-2 border-stone-100 shadow-inner">
+           <h3 className="text-[10px] font-bold uppercase tracking-widest text-stone-400 font-cinzel">Giocatori Connessi ({playerNames.length}):</h3>
+           <div className="flex flex-wrap gap-2">
+              {playerNames.length > 0 ? (
+                playerNames.map((name, i) => (
+                  <div key={i} className={`px-4 py-2 rounded-xl text-xs font-bold border ${name === myPlayerName ? 'bg-red-950 text-white border-red-900' : 'bg-stone-200 text-stone-700 border-stone-300 animate-in zoom-in-50'}`}>
+                    {name} {name === myPlayerName ? '(Tu)' : ''}
+                  </div>
+                ))
+              ) : (
+                <div className="text-stone-400 italic text-xs">Nessun altro ancora...</div>
+              )}
            </div>
         </div>
-        <button 
-          onClick={() => onStart()}
-          className="w-full bg-red-950 text-white font-cinzel text-2xl font-bold py-7 rounded-3xl hover:bg-red-800 transition-all shadow-2xl shadow-red-950/40 active:scale-95"
-        >
-          INIZIA IL GIOCO
-        </button>
+
+        <div className="space-y-4 text-center">
+          <p className="text-xs text-stone-500 leading-relaxed italic px-4">
+            "Quando tutti i giocatori sono apparsi nella lista qui sopra, uno di voi può premere Inizia."
+          </p>
+          <button 
+            onClick={() => onStart()}
+            className="w-full bg-red-950 text-white font-cinzel text-2xl font-bold py-7 rounded-3xl hover:bg-red-800 transition-all shadow-2xl shadow-red-950/40 active:scale-95"
+          >
+            INIZIA IL GIOCO
+          </button>
+        </div>
+        
         <div className="text-center text-[10px] text-stone-400 font-bold uppercase tracking-[0.2em]">
-          Stanza: <span className="text-red-900">{roomId.toUpperCase()}</span>
+          Codice Stanza: <span className="text-red-900">{roomId.toUpperCase()}</span>
         </div>
       </div>
     </div>
