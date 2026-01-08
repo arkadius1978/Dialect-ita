@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { DialectCard, CardType, GameState } from './types';
 import { ALL_CARDS } from './constants';
 import { joinRoom, Room } from 'trystero';
@@ -7,37 +7,43 @@ import { joinRoom, Room } from 'trystero';
 const App: React.FC = () => {
   const [gameState, setGameState] = useState<GameState>({
     gameStarted: false,
+    version: 0,
     decks: { archetypes: [], age1: [], age2: [], age3: [], legacy: [] },
     hands: {},
     tableau: [],
     discardPile: [],
-    currentPlayerId: '',
-    playerIds: [],
   });
-
-  // Ref per lo stato più recente per i nuovi Peer
-  const gameStateRef = useRef(gameState);
-  useEffect(() => {
-    gameStateRef.current = gameState;
-  }, [gameState]);
 
   const [myPlayerName, setMyPlayerName] = useState('');
   const [roomId, setRoomId] = useState('');
   const [peers, setPeers] = useState<string[]>([]);
   const [activeTab, setActiveTab] = useState<'table' | 'hand' | 'discard'>('table');
-  const [selectedCard, setSelectedCard] = useState<DialectCard | null>(null);
+  const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
   
   const roomRef = useRef<Room | null>(null);
   const sendStateRef = useRef<((data: GameState) => void) | null>(null);
+  const lastReceivedVersionRef = useRef<number>(-1);
 
-  // Funzione per aggiornare lo stato in modo atomico e sincronizzato
+  // Helper per ottenere la carta intera dall'ID
+  const getCard = (id: string | null): DialectCard | null => {
+    if (!id) return null;
+    return ALL_CARDS.find(c => c.id === id) || null;
+  };
+
+  // Sincronizzazione: quando lo stato locale cambia e noi siamo gli autori, lo mandiamo agli altri
+  useEffect(() => {
+    if (gameState.gameStarted && sendStateRef.current) {
+      // Se la versione locale è maggiore di quella che abbiamo ricevuto dall'esterno, trasmettiamo
+      if (gameState.version > lastReceivedVersionRef.current) {
+        sendStateRef.current(gameState);
+      }
+    }
+  }, [gameState]);
+
   const updateGameState = useCallback((updater: (prev: GameState) => GameState) => {
     setGameState(prev => {
       const next = updater(prev);
-      if (sendStateRef.current) {
-        sendStateRef.current(next);
-      }
-      return next;
+      return { ...next, version: prev.version + 1 };
     });
   }, []);
 
@@ -53,23 +59,22 @@ const App: React.FC = () => {
   const initializeGame = () => {
     updateGameState(() => ({
       gameStarted: true,
+      version: 1,
       decks: {
-        archetypes: shuffle(ALL_CARDS.filter(c => c.type === CardType.ARCHETYPE)),
-        age1: shuffle(ALL_CARDS.filter(c => c.type === CardType.AGE1)),
-        age2: shuffle(ALL_CARDS.filter(c => c.type === CardType.AGE2)),
-        age3: shuffle(ALL_CARDS.filter(c => c.type === CardType.AGE3)),
-        legacy: shuffle(ALL_CARDS.filter(c => c.type === CardType.LEGACY)),
+        archetypes: shuffle(ALL_CARDS.filter(c => c.type === CardType.ARCHETYPE).map(c => c.id)),
+        age1: shuffle(ALL_CARDS.filter(c => c.type === CardType.AGE1).map(c => c.id)),
+        age2: shuffle(ALL_CARDS.filter(c => c.type === CardType.AGE2).map(c => c.id)),
+        age3: shuffle(ALL_CARDS.filter(c => c.type === CardType.AGE3).map(c => c.id)),
+        legacy: shuffle(ALL_CARDS.filter(c => c.type === CardType.LEGACY).map(c => c.id)),
       },
       hands: { [myPlayerName]: [] },
       tableau: [],
       discardPile: [],
-      currentPlayerId: myPlayerName,
-      playerIds: [myPlayerName],
     }));
   };
 
   const connectToRoom = (rId: string, pName: string) => {
-    const config = { appId: 'dialect-p2p-sync-v1' };
+    const config = { appId: 'dialect-p2p-sync-v2' };
     const room = joinRoom(config, rId.toLowerCase().trim());
     roomRef.current = room;
 
@@ -78,8 +83,9 @@ const App: React.FC = () => {
 
     room.onPeerJoin(peerId => {
       setPeers(prev => [...prev, peerId]);
-      if (gameStateRef.current.gameStarted) {
-        sendState(gameStateRef.current);
+      // Se siamo già in gioco, mandiamo lo stato al nuovo arrivato
+      if (gameState.gameStarted) {
+        sendState(gameState);
       }
     });
 
@@ -88,7 +94,18 @@ const App: React.FC = () => {
     });
 
     getState((data) => {
-      setGameState(data);
+      // Accettiamo lo stato solo se è più recente del nostro o se non abbiamo ancora iniziato
+      setGameState(prev => {
+        if (data.version > prev.version || !prev.gameStarted) {
+          lastReceivedVersionRef.current = data.version;
+          // Assicuriamoci che la nostra mano esista nel nuovo stato ricevuto
+          if (data.gameStarted && !data.hands[pName]) {
+            data.hands[pName] = [];
+          }
+          return data;
+        }
+        return prev;
+      });
     });
 
     setRoomId(rId);
@@ -100,80 +117,85 @@ const App: React.FC = () => {
       const deck = [...prev.decks[deckKey]];
       if (deck.length === 0) return prev;
       
-      const card = deck.pop()!;
-      const myCurrentHand = prev.hands[myPlayerName] || [];
+      const cardId = deck.pop()!;
+      const myCurrentHandIds = prev.hands[myPlayerName] || [];
       
       return {
         ...prev,
         decks: { ...prev.decks, [deckKey]: deck },
-        hands: { ...prev.hands, [myPlayerName]: [...myCurrentHand, card] }
+        hands: { ...prev.hands, [myPlayerName]: [...myCurrentHandIds, cardId] }
       };
     });
   };
 
-  const playCard = (card: DialectCard) => {
+  const playCard = (cardId: string) => {
     updateGameState(prev => {
-      const myHand = (prev.hands[myPlayerName] || []).filter(c => c.id !== card.id);
+      const myHand = (prev.hands[myPlayerName] || []).filter(id => id !== cardId);
       return {
         ...prev,
         hands: { ...prev.hands, [myPlayerName]: myHand },
-        tableau: [...prev.tableau, card]
+        tableau: [...prev.tableau, cardId]
       };
     });
-    setSelectedCard(null);
+    setSelectedCardId(null);
   };
 
-  const discardFromHand = (card: DialectCard) => {
+  const discardFromHand = (cardId: string) => {
     if (!confirm("Vuoi scartare questa carta nel Cimitero?")) return;
     updateGameState(prev => {
-      const myHand = (prev.hands[myPlayerName] || []).filter(c => c.id !== card.id);
+      const myHand = (prev.hands[myPlayerName] || []).filter(id => id !== cardId);
       return {
         ...prev,
         hands: { ...prev.hands, [myPlayerName]: myHand },
-        discardPile: [card, ...prev.discardPile]
+        discardPile: [cardId, ...prev.discardPile]
       };
     });
-    setSelectedCard(null);
+    setSelectedCardId(null);
   };
 
-  const removeFromTableau = (card: DialectCard) => {
+  const removeFromTableau = (cardId: string) => {
     if (!confirm("Vuoi rimuovere questa carta dal tavolo e metterla nel Cimitero?")) return;
     updateGameState(prev => {
-      const newTableau = prev.tableau.filter(c => c.id !== card.id);
+      const newTableau = prev.tableau.filter(id => id !== cardId);
       return {
         ...prev,
         tableau: newTableau,
-        discardPile: [card, ...prev.discardPile]
+        discardPile: [cardId, ...prev.discardPile]
       };
     });
-    setSelectedCard(null);
+    setSelectedCardId(null);
   };
 
-  const CardView: React.FC<{ card: DialectCard, isDiscarded?: boolean }> = ({ card, isDiscarded }) => (
-    <div 
-      onClick={() => setSelectedCard(card)}
-      className={`relative w-40 h-56 rounded-lg shadow-md border p-3 cursor-pointer hover:shadow-xl transition-all flex flex-col justify-between overflow-hidden group
-        ${isDiscarded ? 'bg-stone-100 border-stone-300 opacity-60 grayscale' : card.isAction ? 'border-red-400 bg-red-50/20' : 'bg-white border-stone-200'}
-      `}
-    >
-      <div>
-        <div className="text-[8px] uppercase tracking-tighter text-stone-400 mb-1 font-cinzel">
-          {card.isAction ? 'Azione' : card.type}
+  const CardView: React.FC<{ cardId: string, isDiscarded?: boolean }> = ({ cardId, isDiscarded }) => {
+    const card = getCard(cardId);
+    if (!card) return null;
+
+    return (
+      <div 
+        onClick={() => setSelectedCardId(cardId)}
+        className={`relative w-40 h-56 rounded-lg shadow-md border p-3 cursor-pointer hover:shadow-xl transition-all flex flex-col justify-between overflow-hidden group
+          ${isDiscarded ? 'bg-stone-100 border-stone-300 opacity-60 grayscale' : card.isAction ? 'border-red-400 bg-red-50/20' : 'bg-white border-stone-200'}
+        `}
+      >
+        <div>
+          <div className="text-[8px] uppercase tracking-tighter text-stone-400 mb-1 font-cinzel">
+            {card.isAction ? 'Azione' : card.type}
+          </div>
+          <h3 className={`text-xs font-bold font-cinzel border-b border-stone-100 pb-1 mb-1 leading-tight ${isDiscarded ? 'text-stone-500' : 'text-red-900'}`}>
+            {card.title}
+          </h3>
+          <p className="text-[10px] text-stone-600 leading-tight line-clamp-5">
+            {card.description}
+          </p>
         </div>
-        <h3 className={`text-xs font-bold font-cinzel border-b border-stone-100 pb-1 mb-1 leading-tight ${isDiscarded ? 'text-stone-500' : 'text-red-900'}`}>
-          {card.title}
-        </h3>
-        <p className="text-[10px] text-stone-600 leading-tight line-clamp-5">
-          {card.description}
-        </p>
+        <div className="mt-1 pt-1 border-t border-stone-100">
+          <p className={`text-[9px] italic font-semibold line-clamp-2 ${isDiscarded ? 'text-stone-400' : 'text-red-800'}`}>
+            {card.prompt}
+          </p>
+        </div>
       </div>
-      <div className="mt-1 pt-1 border-t border-stone-100">
-        <p className={`text-[9px] italic font-semibold line-clamp-2 ${isDiscarded ? 'text-stone-400' : 'text-red-800'}`}>
-          {card.prompt}
-        </p>
-      </div>
-    </div>
-  );
+    );
+  };
 
   if (!roomId || !myPlayerName) {
     return <LoginScreen onConnect={connectToRoom} />;
@@ -183,9 +205,10 @@ const App: React.FC = () => {
     return <SetupScreen onStart={initializeGame} roomId={roomId} peersCount={peers.length} />;
   }
 
-  const isCardInHand = gameState.hands[myPlayerName]?.some(c => c.id === selectedCard?.id);
-  const isCardOnTable = gameState.tableau.some(c => c.id === selectedCard?.id);
-  const isCardDiscarded = gameState.discardPile.some(c => c.id === selectedCard?.id);
+  const selectedCard = getCard(selectedCardId);
+  const isCardInHand = gameState.hands[myPlayerName]?.includes(selectedCardId || '');
+  const isCardOnTable = gameState.tableau.includes(selectedCardId || '');
+  const isCardDiscarded = gameState.discardPile.includes(selectedCardId || '');
 
   return (
     <div className="min-h-screen pb-12 flex flex-col bg-[#f5f2e9]">
@@ -213,10 +236,9 @@ const App: React.FC = () => {
               <span className="text-[8px] uppercase tracking-widest text-stone-500 font-bold">Online</span>
               <span className="text-stone-200 font-bold text-xs">{peers.length}</span>
             </div>
-            <div className="h-6 w-px bg-stone-700"></div>
             <button 
               onClick={() => { if(confirm("Tornare al menu principale?")) location.reload(); }}
-              className="text-stone-500 hover:text-red-400 text-[10px] font-bold transition-colors uppercase tracking-widest"
+              className="ml-4 text-stone-500 hover:text-red-400 text-[10px] font-bold transition-colors uppercase tracking-widest"
             >
               Esci
             </button>
@@ -276,7 +298,7 @@ const App: React.FC = () => {
                 {gameState.tableau.length === 0 ? (
                   <p className="text-stone-400 italic text-sm py-10">Il tavolo è vuoto. Pesca una carta e giocala dalla tua mano.</p>
                 ) : (
-                  gameState.tableau.map(card => <CardView key={card.id} card={card} />)
+                  gameState.tableau.map(id => <CardView key={id} cardId={id} />)
                 )}
               </div>
             </div>
@@ -292,7 +314,7 @@ const App: React.FC = () => {
                   <p className="text-stone-400 italic text-sm">Non hai carte in mano. Pesca dai mazzi sul Tavolo.</p>
                 </div>
               ) : (
-                gameState.hands[myPlayerName].map(card => <CardView key={card.id} card={card} />)
+                gameState.hands[myPlayerName].map(id => <CardView key={id} cardId={id} />)
               )}
             </div>
           </div>
@@ -307,14 +329,14 @@ const App: React.FC = () => {
                   <p className="text-stone-400 italic text-sm">Il cimitero è vuoto. Le carte scartate o "strappate" appariranno qui.</p>
                 </div>
               ) : (
-                gameState.discardPile.map(card => <CardView key={card.id} card={card} isDiscarded />)
+                gameState.discardPile.map(id => <CardView key={id} cardId={id} isDiscarded />)
               )}
             </div>
           </div>
         )}
       </main>
 
-      {selectedCard && (
+      {selectedCard && selectedCardId && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-stone-900/70 backdrop-blur-sm animate-in fade-in duration-300">
           <div className="bg-white max-w-sm w-full rounded-2xl shadow-2xl overflow-hidden border-2 border-stone-300 animate-in zoom-in-95">
             <div className={`p-8 ${selectedCard.isAction ? 'bg-red-50' : 'bg-white'} ${isCardDiscarded ? 'grayscale' : ''}`}>
@@ -331,13 +353,13 @@ const App: React.FC = () => {
                 {!isCardDiscarded && isCardInHand && (
                   <>
                     <button 
-                      onClick={() => playCard(selectedCard)}
+                      onClick={() => playCard(selectedCardId)}
                       className="flex-1 bg-red-900 text-white font-bold py-3 rounded-xl hover:bg-red-800 transition-all shadow-lg active:scale-95 text-xs uppercase tracking-widest"
                     >
                       Gioca
                     </button>
                     <button 
-                      onClick={() => discardFromHand(selectedCard)}
+                      onClick={() => discardFromHand(selectedCardId)}
                       className="flex-1 bg-stone-200 text-stone-700 font-bold py-3 rounded-xl hover:bg-stone-300 transition-all text-xs uppercase tracking-widest"
                     >
                       Scarta
@@ -346,7 +368,7 @@ const App: React.FC = () => {
                 )}
                 {!isCardDiscarded && isCardOnTable && (
                   <button 
-                    onClick={() => removeFromTableau(selectedCard)}
+                    onClick={() => removeFromTableau(selectedCardId)}
                     className="flex-1 bg-red-100 text-red-900 font-bold py-3 rounded-xl hover:bg-red-200 transition-all text-xs uppercase tracking-widest"
                   >
                     Scarta al Cimitero
@@ -354,7 +376,7 @@ const App: React.FC = () => {
                 )}
               </div>
               <button 
-                onClick={() => setSelectedCard(null)}
+                onClick={() => setSelectedCardId(null)}
                 className="py-3 px-6 rounded-xl font-bold border border-stone-300 text-stone-500 hover:bg-white transition-all w-full text-xs uppercase tracking-widest"
               >
                 Chiudi
