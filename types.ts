@@ -29,6 +29,7 @@ export interface GameState {
   };
   hands: Record<string, DialectCard[]>;
   tableau: DialectCard[];
+  discardPile: DialectCard[];
   currentPlayerId: string;
   playerIds: string[];
 }
